@@ -1,0 +1,10 @@
+# Core data / ML stack for the X-sentiment price-forecasting pipeline.
+# Pinned to versions known to work together on Python 3.11/3.12.
+pandas==2.2.2
+numpy==1.26.4
+scikit-learn==1.5.2
+yfinance==0.2.43
+vaderSentiment==3.3.2
+matplotlib==3.9.2
+requests==2.32.3
+python-dotenv==1.0.1

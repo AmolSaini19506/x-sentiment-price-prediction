@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Data and generated artifacts (regenerate by running the pipeline)
+# Note: reports/*.md are NOT ignored on purpose - the evaluation report
+# is a project deliverable and belongs in the repo once generated.
+data/*.csv
+data/*.json
+data/*.db
+outputs/*.png
+outputs/*.json
+outputs/*.csv
+
+# OS / editor noise
+.DS_Store
+*.swp
