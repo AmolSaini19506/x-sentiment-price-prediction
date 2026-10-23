@@ -57,25 +57,28 @@ def start_run(since: datetime, until: datetime, max_items: int, sort: str = "Top
     actor_id = config.APIFY_TWITTER_ACTOR_ID.replace("/", "~")
     url = f"{APIFY_API_BASE}/acts/{actor_id}/runs"
 
-    # Input keys verified against the apidojo/tweet-scraper build schema:
-    # the date range is "start"/"end" (an earlier "since"/"until" payload
-    # was silently ignored by the actor, which then scraped only the
-    # newest posts).
+    # Input keys for kaitoeasyapi/twitter-x-data-tweet-scraper (pay-per-
+    # result; verified live 2026-10-23): a single raw search string in
+    # "twitterContent" plus "since"/"until" date bounds. The apidojo
+    # actors used before cap free-plan accounts at 10 items per run,
+    # which made a usable sample impossible; this actor returned 300+
+    # items in a single run on the same free account.
+    query = " OR ".join([*config.TWITTER_SEARCH_TERMS, "BTC", "bitcoin"])
     payload = {
-        "searchTerms": config.TWITTER_SEARCH_TERMS,
-        "start": since.strftime("%Y-%m-%d"),
-        "end": until.strftime("%Y-%m-%d"),
+        "twitterContent": query,
+        "since": since.strftime("%Y-%m-%d"),
+        "until": until.strftime("%Y-%m-%d"),
         "maxItems": max_items,
-        "sort": sort,
-        "tweetLanguage": "en",
+        "queryType": sort,
+        "lang": "en",
     }
     resp = requests.post(url, json=payload, headers=_auth_headers(), timeout=60)
     resp.raise_for_status()
     return resp.json()["data"]["id"]
 
 
-def wait_for_run(run_id: str) -> str:
-    """Poll a run until it succeeds; return its default dataset ID."""
+def wait_for_run(run_id: str) -> tuple[str, float]:
+    """Poll a run until it succeeds; return (dataset ID, usage in USD)."""
     url = f"{APIFY_API_BASE}/actor-runs/{run_id}"
     deadline = time.time() + RUN_TIMEOUT_SECONDS
     while time.time() < deadline:
@@ -84,7 +87,7 @@ def wait_for_run(run_id: str) -> str:
         data = resp.json()["data"]
         status = data["status"]
         if status == "SUCCEEDED":
-            return data["defaultDatasetId"]
+            return data["defaultDatasetId"], float(data.get("usageTotalUsd") or 0.0)
         if status in {"FAILED", "ABORTED", "TIMED-OUT"}:
             raise ApifyError(f"Apify run {run_id} ended with status {status}")
         time.sleep(POLL_INTERVAL_SECONDS)
@@ -171,45 +174,111 @@ def save_tweets(raw_items: list[dict[str, Any]], df: pd.DataFrame) -> None:
         df.to_sql("tweets", conn, if_exists="replace", index=False)
 
 
-# The apidojo actors cap FREE-plan Apify accounts at 10 items per run
-# (stated verbatim in the actor log), so a single 180-day run can never
-# yield a usable sample. The lookback is therefore scraped in
-# WINDOW_DAYS-sized windows, one run each, and the results are merged
-# and de-duplicated. "Top" sort spreads each window's items across most
-# of its days (verified empirically; "Latest" returns one day's posts).
-WINDOW_DAYS = 10
-FREE_PLAN_ITEMS_PER_RUN = 10
+# Scrape geometry for the pay-per-result actor (2026-10-23 run):
+# * The window is anchored to the last available price bar so the tweet
+#   sample is a contiguous span ending with the price history, not a
+#   moving "now" window.
+# * 3-day windows with "Top" sort: one run returns ~300+ posts spread
+#   across the window's days at roughly $0.00023/post all-in, so a
+#   132-day span costs about $3.50 of the $5 free-plan credit.
+# * SPEND_GUARD_USD is a hard stop: no new window is started once the
+#   cumulative scrape spend passes it (the free plan has no headroom
+#   beyond $5 and no payment method is attached).
+SCRAPE_DAYS = 132
+WINDOW_DAYS = 3
+ITEMS_PER_RUN = 350
+MAX_WORKERS = 4
+SPEND_GUARD_USD = 4.15
+
+
+def _target_window() -> tuple[datetime, datetime]:
+    """Contiguous scrape span [start, end) ending at the last price bar."""
+    prices = pd.read_csv(config.PRICES_CSV, usecols=["date"])
+    last_bar = pd.to_datetime(prices["date"]).max().date()
+    end = datetime(last_bar.year, last_bar.month, last_bar.day, tzinfo=timezone.utc)
+    end += timedelta(days=1)  # 'until' is exclusive; include the last bar's day
+    return end - timedelta(days=SCRAPE_DAYS), end
+
+
+def _existing_covers(start: datetime, end: datetime) -> bool:
+    """True when tweets.csv already holds a full scrape of the window.
+
+    Makes re-running the pipeline (scripts/run_all.sh) cheap: the tweet
+    stage becomes a no-op instead of paying for the same scrape twice.
+    """
+    if not config.TWEETS_CSV.exists():
+        return False
+    try:
+        df = pd.read_csv(config.TWEETS_CSV, usecols=["created_at"])
+    except Exception:
+        return False
+    if len(df) < 5000:
+        return False
+    ts = pd.to_datetime(df["created_at"], utc=True, errors="coerce").dropna()
+    if ts.empty:
+        return False
+    return ts.min().date() <= (start + timedelta(days=2)).date() and \
+        ts.max().date() >= (end - timedelta(days=2)).date()
 
 
 def main() -> None:
-    until = datetime.now(timezone.utc)
-    since = until - timedelta(days=config.LOOKBACK_DAYS)
+    since, until = _target_window()
+    if _existing_covers(since, until):
+        print("[tweets] existing tweets.csv already covers "
+              f"{since.date()}..{until.date()}; skipping scrape")
+        return
+
+    windows = []
+    w = since
+    while w < until:
+        windows.append((w, min(w + timedelta(days=WINDOW_DAYS), until)))
+        w += timedelta(days=WINDOW_DAYS)
 
     print(f"[tweets] starting Apify actor {config.APIFY_TWITTER_ACTOR_ID} ...")
-    all_items: list[dict[str, Any]] = []
-    seen_ids: set = set()
-    window_start = since
-    while window_start < until:
-        window_end = min(window_start + timedelta(days=WINDOW_DAYS), until)
-        run_id = start_run(window_start, window_end, FREE_PLAN_ITEMS_PER_RUN)
-        print(
-            f"[tweets] run {run_id} for "
-            f"{window_start.date()}..{window_end.date()}; polling ..."
-        )
-        dataset_id = wait_for_run(run_id)
-        items = fetch_dataset(dataset_id)
-        fresh = 0
-        for item in items:
-            key = item.get("id") or item.get("url")
-            if key is not None:
-                if key in seen_ids:
-                    continue
-                seen_ids.add(key)
-            all_items.append(item)
-            fresh += 1
-        print(f"[tweets]   +{fresh} items ({len(all_items)} total)")
-        window_start = window_end
+    print(f"[tweets] {len(windows)} windows of {WINDOW_DAYS}d, "
+          f"{since.date()}..{until.date()}, up to {ITEMS_PER_RUN} posts each")
 
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    lock = threading.Lock()
+    state = {"spend": 0.0, "items": [], "seen": set(), "done": 0, "stopped": False}
+
+    def _scrape(window: tuple[datetime, datetime]) -> None:
+        w_start, w_end = window
+        with lock:
+            if state["stopped"]:
+                return
+        run_id = start_run(w_start, w_end, ITEMS_PER_RUN)
+        dataset_id, cost = wait_for_run(run_id)
+        items = fetch_dataset(dataset_id)
+        with lock:
+            state["spend"] += cost
+            state["done"] += 1
+            fresh = 0
+            for item in items:
+                key = item.get("id") or item.get("url")
+                if key is not None:
+                    if key in state["seen"]:
+                        continue
+                    state["seen"].add(key)
+                state["items"].append(item)
+                fresh += 1
+            print(f"[tweets] window {w_start.date()}..{w_end.date()}: "
+                  f"+{fresh} items, ${cost:.3f} "
+                  f"({state['done']}/{len(windows)} windows, "
+                  f"${state['spend']:.2f} total)")
+            if state["spend"] >= SPEND_GUARD_USD:
+                state["stopped"] = True
+                print(f"[tweets] SPEND GUARD hit at ${state['spend']:.2f}; "
+                      "no further windows will be started")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        list(pool.map(_scrape, windows))
+
+    all_items = state["items"]
+    print(f"[tweets] scrape finished: {len(all_items)} raw posts, "
+          f"${state['spend']:.2f} Apify usage")
     df = normalize(all_items)
     save_tweets(all_items, df)
     print(f"[tweets] {len(all_items)} raw posts -> {len(df)} normalised rows")
