@@ -212,7 +212,7 @@ def _existing_covers(start: datetime, end: datetime) -> bool:
         df = pd.read_csv(config.TWEETS_CSV, usecols=["created_at"])
     except Exception:
         return False
-    if len(df) < 5000:
+    if len(df) < 1000:
         return False
     ts = pd.to_datetime(df["created_at"], utc=True, errors="coerce").dropna()
     if ts.empty:
