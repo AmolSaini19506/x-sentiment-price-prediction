@@ -4,8 +4,8 @@
 Predict Bitcoin's (BTC-USD) price at horizons n+0, n+1, n+2, n+3, n+4 and n+5 days using **only** X (Twitter) sentiment features and price history, and evaluate the forecasts with rigorous out-of-sample walk-forward validation.
 
 ## 2. Data
-- **Prices:** daily OHLCV for BTC-USD via yfinance, last 180 days.
-- **X posts:** scraped with Apify (search terms $BTC, Bitcoin), timestamps aligned to UTC days; engagement (likes, reposts, views) and author follower counts retained.
+- **Prices:** daily OHLCV for BTC-USD, last 180 days, fetched via the CoinGecko API. Yahoo Finance (via yfinance) is the primary source in code but rate-limits this machine, so this run used the CoinGecko fallback; the `source` column in `data/prices.csv` records CoinGecko for every row, and OHLC mirrors the close for those rows.
+- **X posts:** 1,858 unique posts scraped with Apify between 2026-06-13 and 2026-10-23 (search terms $BTC, Bitcoin), timestamps aligned to UTC days; engagement (likes, reposts, views) and author follower counts retained. The main scrape used the actor `kaitoeasyapi/twitter-x-data-tweet-scraper-pay-per-result-cheapest`; an initial attempt with `apidojo/tweet-scraper` was capped by Apify free-plan limits and contributed only a small early sample.
 - **News:** recent Bitcoin coverage via the Tavily API, used as qualitative context for sentiment moves.
 - Prices and posts are joined in a SQLite database (`data/agent.db`, tables `prices` and `tweets`).
 

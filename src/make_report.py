@@ -50,14 +50,24 @@ def build_evaluation_report(metrics: dict) -> str:
     lines.append("")
     lines.append("## 2. Data")
     lines.append(
-        f"- **Prices:** daily OHLCV for {config.TICKER} via yfinance, "
-        f"last {config.LOOKBACK_DAYS} days."
+        f"- **Prices:** daily OHLCV for {config.TICKER}, last "
+        f"{config.LOOKBACK_DAYS} days, fetched via the CoinGecko API. "
+        "Yahoo Finance (via yfinance) is the primary source in code but "
+        "rate-limits this machine, so this run used the CoinGecko "
+        "fallback; the `source` column in `data/prices.csv` records "
+        "CoinGecko for every row, and OHLC mirrors the close for those "
+        "rows."
     )
     lines.append(
-        "- **X posts:** scraped with Apify (search terms "
-        f"{', '.join(config.TWITTER_SEARCH_TERMS)}), timestamps aligned to "
-        "UTC days; engagement (likes, reposts, views) and author follower "
-        "counts retained."
+        "- **X posts:** 1,858 unique posts scraped with Apify between "
+        "2026-06-13 and 2026-10-23 (search terms "
+        f"{', '.join(config.TWITTER_SEARCH_TERMS)}), timestamps aligned "
+        "to UTC days; engagement (likes, reposts, views) and author "
+        "follower counts retained. The main scrape used the actor "
+        "`kaitoeasyapi/twitter-x-data-tweet-scraper-pay-per-result-cheapest`; "
+        "an initial attempt with `apidojo/tweet-scraper` was capped by "
+        "Apify free-plan limits and contributed only a small early "
+        "sample."
     )
     lines.append(
         "- **News:** recent Bitcoin coverage via the Tavily API, used as "
