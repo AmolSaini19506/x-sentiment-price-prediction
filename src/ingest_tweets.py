@@ -52,19 +52,21 @@ def _auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {config.APIFY_TOKEN}"}
 
 
-def start_run(since: datetime, until: datetime) -> str:
+def start_run(since: datetime, until: datetime, max_items: int, sort: str = "Top") -> str:
     """Start the Twitter actor run and return its run ID."""
     actor_id = config.APIFY_TWITTER_ACTOR_ID.replace("/", "~")
     url = f"{APIFY_API_BASE}/acts/{actor_id}/runs"
 
-    # Input schema shared by most Apify Twitter search scrapers. If the
-    # chosen actor expects different keys, adjust this payload only.
+    # Input keys verified against the apidojo/tweet-scraper build schema:
+    # the date range is "start"/"end" (an earlier "since"/"until" payload
+    # was silently ignored by the actor, which then scraped only the
+    # newest posts).
     payload = {
         "searchTerms": config.TWITTER_SEARCH_TERMS,
-        "since": since.strftime("%Y-%m-%d"),
-        "until": until.strftime("%Y-%m-%d"),
-        "maxItems": config.TWITTER_MAX_ITEMS,
-        "sort": "Latest",
+        "start": since.strftime("%Y-%m-%d"),
+        "end": until.strftime("%Y-%m-%d"),
+        "maxItems": max_items,
+        "sort": sort,
         "tweetLanguage": "en",
     }
     resp = requests.post(url, json=payload, headers=_auth_headers(), timeout=60)
@@ -154,6 +156,14 @@ def normalize(items: list[dict[str, Any]]) -> pd.DataFrame:
 
 
 def save_tweets(raw_items: list[dict[str, Any]], df: pd.DataFrame) -> None:
+    if df.empty:
+        # Never clobber previously ingested data with an empty result
+        # (e.g. the actor returned only noResults markers because the
+        # account hit a plan limit). Raising lets run_pipeline fall
+        # back to the existing tweets.csv, per its documented design.
+        raise ApifyError(
+            "ingestion produced 0 usable posts; keeping existing data"
+        )
     with open(config.TWEETS_RAW_JSON, "w", encoding="utf-8") as fh:
         json.dump(raw_items, fh, ensure_ascii=False)
     df.to_csv(config.TWEETS_CSV, index=False)
@@ -161,19 +171,48 @@ def save_tweets(raw_items: list[dict[str, Any]], df: pd.DataFrame) -> None:
         df.to_sql("tweets", conn, if_exists="replace", index=False)
 
 
+# The apidojo actors cap FREE-plan Apify accounts at 10 items per run
+# (stated verbatim in the actor log), so a single 180-day run can never
+# yield a usable sample. The lookback is therefore scraped in
+# WINDOW_DAYS-sized windows, one run each, and the results are merged
+# and de-duplicated. "Top" sort spreads each window's items across most
+# of its days (verified empirically; "Latest" returns one day's posts).
+WINDOW_DAYS = 10
+FREE_PLAN_ITEMS_PER_RUN = 10
+
+
 def main() -> None:
     until = datetime.now(timezone.utc)
     since = until - timedelta(days=config.LOOKBACK_DAYS)
 
     print(f"[tweets] starting Apify actor {config.APIFY_TWITTER_ACTOR_ID} ...")
-    run_id = start_run(since, until)
-    print(f"[tweets] run {run_id} started; polling ...")
-    dataset_id = wait_for_run(run_id)
+    all_items: list[dict[str, Any]] = []
+    seen_ids: set = set()
+    window_start = since
+    while window_start < until:
+        window_end = min(window_start + timedelta(days=WINDOW_DAYS), until)
+        run_id = start_run(window_start, window_end, FREE_PLAN_ITEMS_PER_RUN)
+        print(
+            f"[tweets] run {run_id} for "
+            f"{window_start.date()}..{window_end.date()}; polling ..."
+        )
+        dataset_id = wait_for_run(run_id)
+        items = fetch_dataset(dataset_id)
+        fresh = 0
+        for item in items:
+            key = item.get("id") or item.get("url")
+            if key is not None:
+                if key in seen_ids:
+                    continue
+                seen_ids.add(key)
+            all_items.append(item)
+            fresh += 1
+        print(f"[tweets]   +{fresh} items ({len(all_items)} total)")
+        window_start = window_end
 
-    items = fetch_dataset(dataset_id)
-    df = normalize(items)
-    save_tweets(items, df)
-    print(f"[tweets] {len(items)} raw posts -> {len(df)} normalised rows")
+    df = normalize(all_items)
+    save_tweets(all_items, df)
+    print(f"[tweets] {len(all_items)} raw posts -> {len(df)} normalised rows")
     print(f"[tweets] wrote {config.TWEETS_CSV} and table 'tweets' in {config.DB_PATH}")
 
 
